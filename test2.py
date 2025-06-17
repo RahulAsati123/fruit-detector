@@ -1,4 +1,4 @@
-# enhanced_fruit_detector.py
+# enhanced_multi_fruit_detector.py
 import streamlit as st
 import torch
 import torch.nn as nn
@@ -11,11 +11,12 @@ import cv2
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 import av
 
-# Define the class BEFORE loading the pickle file
-class QualcommAppleOrangeClassifier:
-    def __init__(self, model_name="mobilenet_v2"):
-        """Initialize with model"""
+# Multi-Fruit Classifier for 10 different fruits
+class MultiFruitClassifier:
+    def __init__(self, model_name="mobilenet_v2", num_classes=10):
+        """Initialize with model for multiple fruit classes"""
         self.base_model = models.mobilenet_v2(pretrained=True)
+        self.num_classes = num_classes
         self.modify_classifier()
         
         self.transform = transforms.Compose([
@@ -25,17 +26,22 @@ class QualcommAppleOrangeClassifier:
                                std=[0.229, 0.224, 0.225])
         ])
         
-        self.classes = ['apple', 'orange']
+        # Extended fruit classes - 10 different fruits
+        self.classes = [
+            'apple', 'avocado', 'banana', 'cherry', 'kiwi', 
+            'mango', 'orange', 'pineapple', 'strawberry', 'watermelon'
+        ]
+        
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.base_model.to(self.device)
     
     def modify_classifier(self):
         if hasattr(self.base_model, 'classifier'):
             in_features = self.base_model.classifier[-1].in_features
-            self.base_model.classifier[-1] = nn.Linear(in_features, 2)
+            self.base_model.classifier[-1] = nn.Linear(in_features, self.num_classes)
         elif hasattr(self.base_model, 'fc'):
             in_features = self.base_model.fc.in_features
-            self.base_model.fc = nn.Linear(in_features, 2)
+            self.base_model.fc = nn.Linear(in_features, self.num_classes)
     
     def predict_single_image(self, image):
         self.base_model.eval()
@@ -53,32 +59,40 @@ class QualcommAppleOrangeClassifier:
             predicted_class = torch.argmax(probabilities, dim=1).item()
             confidence = probabilities[0][predicted_class].item()
         
+        # Create probability dictionary for all classes
+        prob_dict = {}
+        for i, class_name in enumerate(self.classes):
+            prob_dict[class_name] = probabilities[0][i].item()
+        
         return {
             'predicted_class': self.classes[predicted_class],
             'confidence': confidence,
-            'probabilities': {
-                'apple': probabilities[0][0].item(),
-                'orange': probabilities[0][1].item()
-            }
+            'probabilities': prob_dict
         }
 
-class BasketOrangeDetector:
-    def __init__(self, model_path):
+class BasketMultiFruitDetector:
+    def __init__(self, model_path=None, target_fruit='orange'):
         self.device = torch.device('cpu')
+        self.target_fruit = target_fruit.lower()
         
-        if model_path.endswith('.pkl'):
-            with open(model_path, 'rb') as f:
-                deployment_package = pickle.load(f)
-                self.classifier = deployment_package['classifier']
-                self.classes = deployment_package['classes']
-        elif model_path.endswith('.pt'):
-            checkpoint = torch.load(model_path, map_location='cpu')
-            self.classes = checkpoint['classes']
-            
-            self.model = models.mobilenet_v2(pretrained=False)
-            self.model.classifier[-1] = nn.Linear(self.model.classifier[-1].in_features, 2)
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-            self.model.eval()
+        # Initialize with multi-fruit classifier
+        if model_path and model_path.endswith('.pkl'):
+            try:
+                with open(model_path, 'rb') as f:
+                    deployment_package = pickle.load(f)
+                    self.classifier = deployment_package['classifier']
+                    self.classes = deployment_package.get('classes', [
+                        'apple', 'avocado', 'banana', 'cherry', 'kiwi', 
+                        'mango', 'orange', 'pineapple', 'strawberry', 'watermelon'
+                    ])
+            except FileNotFoundError:
+                st.warning(f"Model file {model_path} not found. Using default multi-fruit classifier.")
+                self.classifier = MultiFruitClassifier(num_classes=10)
+                self.classes = self.classifier.classes
+        else:
+            # Use default multi-fruit classifier
+            self.classifier = MultiFruitClassifier(num_classes=10)
+            self.classes = self.classifier.classes
         
         self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
@@ -88,24 +102,7 @@ class BasketOrangeDetector:
         ])
     
     def predict_single_crop(self, image_crop):
-        if hasattr(self, 'classifier'):
-            return self.classifier.predict_single_image(image_crop)
-        else:
-            input_tensor = self.transform(image_crop).unsqueeze(0)
-            with torch.no_grad():
-                output = self.model(input_tensor)
-                probabilities = torch.nn.functional.softmax(output, dim=1)
-                predicted_class = torch.argmax(probabilities, dim=1).item()
-                confidence = probabilities[0][predicted_class].item()
-            
-            return {
-                'predicted_class': self.classes[predicted_class],
-                'confidence': confidence,
-                'probabilities': {
-                    'apple': probabilities[0][0].item(),
-                    'orange': probabilities[0][1].item()
-                }
-            }
+        return self.classifier.predict_single_image(image_crop)
     
     def create_overlapping_crops(self, image, grid_size=4, overlap=0.3):
         img_array = np.array(image)
@@ -136,51 +133,66 @@ class BasketOrangeDetector:
         
         return crops, crop_info
     
-    def detect_oranges_in_basket(self, image, confidence_threshold=0.6):
+    def detect_fruits_in_basket(self, image, confidence_threshold=0.6):
         crops, crop_info = self.create_overlapping_crops(image, grid_size=4, overlap=0.3)
         
-        orange_detections = []
+        target_detections = []
         all_predictions = []
+        fruit_counts = {fruit: 0 for fruit in self.classes}
+        fruit_confidences = {fruit: [] for fruit in self.classes}
         
         for i, (crop, info) in enumerate(zip(crops, crop_info)):
             try:
                 prediction = self.predict_single_crop(crop)
                 all_predictions.append(prediction)
                 
-                if (prediction['predicted_class'] == 'orange' and 
-                    prediction['confidence'] > confidence_threshold):
+                predicted_fruit = prediction['predicted_class']
+                confidence = prediction['confidence']
+                
+                # Count all fruits detected with confidence above threshold
+                if confidence > confidence_threshold:
+                    fruit_counts[predicted_fruit] += 1
+                    fruit_confidences[predicted_fruit].append(confidence)
+                
+                # Track target fruit detections
+                if (predicted_fruit == self.target_fruit and 
+                    confidence > confidence_threshold):
                     
-                    orange_detections.append({
+                    target_detections.append({
                         'crop_id': i,
                         'position': info['position'],
                         'coordinates': info['coordinates'],
                         'center': info['center'],
-                        'confidence': prediction['confidence'],
-                        'orange_probability': prediction['probabilities']['orange']
+                        'confidence': confidence,
+                        'fruit_type': predicted_fruit,
+                        'probability': prediction['probabilities'][predicted_fruit]
                     })
             except Exception as e:
                 st.warning(f"Error processing crop {i}: {e}")
         
-        orange_confidences = [det['confidence'] for det in orange_detections]
-        apple_confidences = [pred['probabilities']['apple'] for pred in all_predictions 
-                           if pred['predicted_class'] == 'apple']
-        
         total_crops = len(all_predictions)
-        orange_crops = len(orange_detections)
-        apple_crops = sum(1 for pred in all_predictions if pred['predicted_class'] == 'apple')
+        target_crops = len(target_detections)
         
-        has_orange = orange_crops > 0
-        orange_percentage = (orange_crops / total_crops) * 100 if total_crops > 0 else 0
+        has_target_fruit = target_crops > 0
+        target_percentage = (target_crops / total_crops) * 100 if total_crops > 0 else 0
+        
+        # Calculate average confidences for each fruit type
+        avg_confidences = {}
+        for fruit in self.classes:
+            if fruit_confidences[fruit]:
+                avg_confidences[fruit] = np.mean(fruit_confidences[fruit])
+            else:
+                avg_confidences[fruit] = 0.0
         
         return {
-            'has_orange': has_orange,
-            'orange_detections': orange_detections,
+            'has_target_fruit': has_target_fruit,
+            'target_fruit': self.target_fruit,
+            'target_detections': target_detections,
             'total_crops_analyzed': total_crops,
-            'orange_crops_found': orange_crops,
-            'apple_crops_found': apple_crops,
-            'orange_percentage': orange_percentage,
-            'average_orange_confidence': np.mean(orange_confidences) if orange_confidences else 0,
-            'average_apple_confidence': np.mean(apple_confidences) if apple_confidences else 0,
+            'target_crops_found': target_crops,
+            'target_percentage': target_percentage,
+            'fruit_counts': fruit_counts,
+            'average_confidences': avg_confidences,
             'all_predictions': all_predictions,
             'crop_info': crop_info
         }
@@ -189,13 +201,38 @@ class BasketOrangeDetector:
         vis_image = image.copy()
         draw = ImageDraw.Draw(vis_image)
         
-        for detection in detection_results['orange_detections']:
+        # Color mapping for different fruits
+        fruit_colors = {
+            'apple': 'red', 'avocado': 'green', 'banana': 'yellow',
+            'cherry': 'darkred', 'kiwi': 'brown', 'mango': 'orange',
+            'orange': 'orange', 'pineapple': 'gold', 'strawberry': 'pink',
+            'watermelon': 'lightgreen'
+        }
+        
+        # Draw all detected fruits, not just target fruit
+        all_detections = []
+        
+        # Get all high-confidence detections
+        for i, (crop_info, prediction) in enumerate(zip(detection_results['crop_info'], detection_results['all_predictions'])):
+            if prediction['confidence'] > 0.6:  # Use same threshold
+                all_detections.append({
+                    'coordinates': crop_info['coordinates'],
+                    'confidence': prediction['confidence'],
+                    'fruit_type': prediction['predicted_class']
+                })
+        
+        for detection in all_detections:
             coords = detection['coordinates']
             confidence = detection['confidence']
+            fruit_type = detection['fruit_type']
             
-            draw.rectangle(coords, outline='orange', width=3)
+            color = fruit_colors.get(fruit_type, 'blue')
             
-            label = f"Orange: {confidence:.2f}"
+            # Draw rectangle
+            draw.rectangle(coords, outline=color, width=3)
+            
+            # Add label
+            label = f"{fruit_type.title()}: {confidence:.2f}"
             try:
                 font = ImageFont.load_default()
             except:
@@ -204,53 +241,68 @@ class BasketOrangeDetector:
             text_x = coords[0]
             text_y = coords[1] - 20 if coords[1] > 20 else coords[1]
             
-            draw.text((text_x, text_y), label, fill='orange', font=font)
+            draw.text((text_x, text_y), label, fill=color, font=font)
         
         return vis_image
 
-# WebRTC configuration for camera
+# Enhanced WebRTC configuration
 RTC_CONFIGURATION = RTCConfiguration(
-    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+    {
+        "iceServers": [
+            {"urls": ["stun:stun.l.google.com:19302"]},
+            {
+                "urls": ["turn:openrelay.metered.ca:80"],
+                "username": "openrelayproject",
+                "credential": "openrelayproject",
+            },
+        ]
+    }
 )
 
 @st.cache_resource
-def load_detector():
+def load_detector(target_fruit):
     try:
-        model_path = "qualcomm_apple_orange_classifier.pkl"
-        detector = BasketOrangeDetector(model_path)
+        detector = BasketMultiFruitDetector(target_fruit=target_fruit)
         return detector
     except Exception as e:
         st.error(f"Error loading model: {e}")
-        try:
-            model_path = "qualcomm_apple_orange_classifier.pt"
-            detector = BasketOrangeDetector(model_path)
-            return detector
-        except Exception as e2:
-            st.error(f"Error loading .pt file: {e2}")
-            return None
+        return None
 
 def main():
     st.set_page_config(
-        page_title="Orange in Basket Detector",
-        page_icon="🍊",
+        page_title="Multi-Fruit Detector",
+        page_icon="🍎",
         layout="wide"
     )
     
-    st.title("🍎🍊 Orange in Apple Basket Detector")
-    st.write("**Enhanced Binary Classifier with Camera Support**")
-    
-    # Load detector
-    detector = load_detector()
-    if detector is None:
-        st.error("Failed to load the model. Please check your model files.")
-        st.stop()
+    st.title("🍎🍊🥭 Multi-Fruit Basket Detector")
+    st.write("**Advanced Classifier Supporting 10 Different Fruits with Fixed Camera**")
     
     # Sidebar controls
     st.sidebar.header("🎛️ Detection Settings")
+    
+    # Fruit selection
+    available_fruits = [
+        'apple', 'avocado', 'banana', 'cherry', 'kiwi', 
+        'mango', 'orange', 'pineapple', 'strawberry', 'watermelon'
+    ]
+    
+    target_fruit = st.sidebar.selectbox(
+        "Select target fruit to detect:",
+        available_fruits,
+        index=6  # Default to orange
+    )
+    
     confidence_threshold = st.sidebar.slider(
-        "Orange Confidence Threshold", 
+        f"{target_fruit.title()} Confidence Threshold", 
         0.5, 0.95, 0.6, 0.05
     )
+    
+    # Load detector with selected fruit
+    detector = load_detector(target_fruit)
+    if detector is None:
+        st.error("Failed to load the model.")
+        st.stop()
     
     # Input method selection
     st.sidebar.header("📷 Input Method")
@@ -275,10 +327,10 @@ def main():
                 image = Image.open(uploaded_file).convert('RGB')
                 st.image(image, caption="Uploaded Image", use_container_width=True)
                 
-                if st.button("🔍 Analyze Basket", type="primary"):
-                    with st.spinner("Analyzing fruit basket..."):
+                if st.button(f"🔍 Detect {target_fruit.title()}", type="primary"):
+                    with st.spinner(f"Analyzing for {target_fruit}..."):
                         try:
-                            results = detector.detect_oranges_in_basket(
+                            results = detector.detect_fruits_in_basket(
                                 image, 
                                 confidence_threshold=confidence_threshold
                             )
@@ -293,141 +345,212 @@ def main():
         elif input_method == "Camera Capture":
             st.header("📸 Camera Capture")
             
-            # Simple camera input
-            camera_photo = st.camera_input("Take a photo of the fruit basket")
-            
-            if camera_photo is not None:
-                image = Image.open(camera_photo).convert('RGB')
-                st.image(image, caption="Captured Image", use_container_width=True)
+            try:
+                camera_photo = st.camera_input("Take a photo of the fruit basket")
                 
-                if st.button("🔍 Analyze Captured Image", type="primary"):
-                    with st.spinner("Analyzing captured image..."):
-                        try:
-                            results = detector.detect_oranges_in_basket(
-                                image, 
-                                confidence_threshold=confidence_threshold
-                            )
-                            
-                            st.session_state.results = results
-                            st.session_state.original_image = image
-                            st.session_state.analyzed = True
-                            
-                        except Exception as e:
-                            st.error(f"Error during analysis: {e}")
+                if camera_photo is not None:
+                    image = Image.open(camera_photo).convert('RGB')
+                    st.image(image, caption="Captured Image", use_container_width=True)
+                    
+                    if st.button(f"🔍 Detect {target_fruit.title()}", type="primary"):
+                        with st.spinner(f"Analyzing for {target_fruit}..."):
+                            try:
+                                results = detector.detect_fruits_in_basket(
+                                    image, 
+                                    confidence_threshold=confidence_threshold
+                                )
+                                
+                                st.session_state.results = results
+                                st.session_state.original_image = image
+                                st.session_state.analyzed = True
+                                
+                            except Exception as e:
+                                st.error(f"Error during analysis: {e}")
+            except Exception as e:
+                st.error(f"Camera access error: {e}")
+                st.info("Please ensure your browser has camera permissions enabled.")
         
         elif input_method == "Live Camera":
             st.header("📹 Live Camera Feed")
-            st.info("Click on the camera feed to capture an image for analysis")
+            st.info("Real-time camera feed - Click 'Capture Frame' to analyze")
             
-            # Initialize session state for captured frame
+            # Initialize session state
             if 'captured_frame' not in st.session_state:
                 st.session_state.captured_frame = None
+            if 'latest_frame' not in st.session_state:
+                st.session_state.latest_frame = None
             
-            # WebRTC camera stream
+            # Fixed WebRTC implementation
             class VideoProcessor:
                 def __init__(self):
-                    self.captured_frame = None
+                    self.frame_count = 0
                 
                 def recv(self, frame):
+                    self.frame_count += 1
                     img = frame.to_ndarray(format="bgr24")
                     
-                    # Store the frame for analysis
-                    st.session_state.latest_frame = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    # Store the latest frame
+                    if self.frame_count % 10 == 0:
+                        st.session_state.latest_frame = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                     
-                    # Add text overlay
-                    cv2.putText(img, "Click 'Capture Frame' to analyze", 
-                               (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    # Add overlay text
+                    cv2.putText(img, "Live Multi-Fruit Detection Feed", 
+                               (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    cv2.putText(img, f"Target: {target_fruit.title()}", 
+                               (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
                     
                     return av.VideoFrame.from_ndarray(img, format="bgr24")
             
-            webrtc_ctx = webrtc_streamer(
-                key="live-camera",
-                mode=WebRtcMode.SENDRECV,
-                rtc_configuration=RTC_CONFIGURATION,
-                video_processor_factory=VideoProcessor,
-                media_stream_constraints={"video": True, "audio": False},
-                async_processing=True,
-            )
-            
-            # Capture button
-            if st.button("📸 Capture Current Frame"):
-                if 'latest_frame' in st.session_state:
-                    st.session_state.captured_frame = st.session_state.latest_frame
-                    st.success("Frame captured! Check the results panel.")
-                else:
-                    st.error("No frame available. Please ensure camera is active.")
-            
-            # Show captured frame
-            if st.session_state.carried_frame is not None:
-                st.image(st.session_state.captured_frame, caption="Captured Frame", use_container_width=True)
+            try:
+                webrtc_ctx = webrtc_streamer(
+                    key="multi-fruit-camera",
+                    mode=WebRtcMode.SENDRECV,
+                    rtc_configuration=RTC_CONFIGURATION,
+                    video_processor_factory=VideoProcessor,
+                    media_stream_constraints={
+                        "video": {
+                            "width": {"min": 640, "ideal": 1280, "max": 1920},
+                            "height": {"min": 480, "ideal": 720, "max": 1080},
+                        },
+                        "audio": False
+                    },
+                    async_processing=True,
+                )
                 
-                if st.button("🔍 Analyze Captured Frame", type="primary"):
-                    with st.spinner("Analyzing captured frame..."):
-                        try:
-                            image = Image.fromarray(st.session_state.captured_frame)
-                            results = detector.detect_oranges_in_basket(
-                                image, 
-                                confidence_threshold=confidence_threshold
-                            )
-                            
-                            st.session_state.results = results
-                            st.session_state.original_image = image
-                            st.session_state.analyzed = True
-                            
-                        except Exception as e:
-                            st.error(f"Error during analysis: {e}")
+                # Capture controls
+                col_capture, col_status = st.columns([1, 2])
+                
+                with col_capture:
+                    capture_clicked = st.button("📸 Capture Current Frame", type="primary")
+                
+                with col_status:
+                    if webrtc_ctx.state.playing:
+                        st.success("🟢 Camera Active")
+                    else:
+                        st.warning("🔴 Camera Not Active")
+                
+                # Handle frame capture - FIXED the typo here
+                if capture_clicked:
+                    if st.session_state.latest_frame is not None:
+                        st.session_state.captured_frame = st.session_state.latest_frame.copy()
+                        st.success("✅ Frame captured successfully!")
+                    else:
+                        st.error("❌ No frame available. Please ensure camera is active.")
+                
+                # Show captured frame and analysis
+                if st.session_state.captured_frame is not None:
+                    st.write("### 📸 Captured Frame")
+                    st.image(st.session_state.captured_frame, caption="Captured Frame", use_container_width=True)
+                    
+                    if st.button(f"🔍 Analyze for {target_fruit.title()}", type="primary"):
+                        with st.spinner(f"Analyzing for {target_fruit}..."):
+                            try:
+                                image = Image.fromarray(st.session_state.captured_frame)
+                                results = detector.detect_fruits_in_basket(
+                                    image, 
+                                    confidence_threshold=confidence_threshold
+                                )
+                                
+                                st.session_state.results = results
+                                st.session_state.original_image = image
+                                st.session_state.analyzed = True
+                                
+                            except Exception as e:
+                                st.error(f"Error during analysis: {e}")
+                
+            except Exception as e:
+                st.error(f"WebRTC Error: {e}")
+                st.info("Live camera may not work in all environments. Try 'Camera Capture' instead.")
     
     with col2:
-        st.header("📊 Detection Results")
+        st.header("📊 Multi-Fruit Detection Results")
         
         if hasattr(st.session_state, 'analyzed') and st.session_state.analyzed:
             results = st.session_state.results
             original_image = st.session_state.original_image
             
             # Main result display
-            if results['has_orange']:
-                st.success("🍊 **ORANGES DETECTED IN BASKET!**")
-                st.write(f"**Found oranges in {results['orange_crops_found']} out of {results['total_crops_analyzed']} analyzed regions**")
+            if results['has_target_fruit']:
+                st.success(f"🎯 **{results['target_fruit'].upper()} DETECTED IN BASKET!**")
+                st.write(f"**Found {results['target_fruit']} in {results['target_crops_found']} out of {results['total_crops_analyzed']} analyzed regions**")
             else:
-                st.info("🍎 **ONLY APPLES DETECTED**")
-                st.write(f"**Analyzed {results['total_crops_analyzed']} regions, no oranges found**")
+                st.info(f"❌ **NO {results['target_fruit'].upper()} DETECTED**")
+                st.write(f"**Analyzed {results['total_crops_analyzed']} regions, no {results['target_fruit']} found**")
             
-            # Statistics
-            col_orange, col_apple, col_percent = st.columns(3)
+            # All fruits distribution
+            st.write("### 🍎 All Fruits Distribution in Basket")
+            fruit_counts = results['fruit_counts']
             
-            with col_orange:
-                st.metric("🍊 Orange Regions", results['orange_crops_found'])
+            # Display fruit counts in a grid
+            cols = st.columns(5)
+            col_idx = 0
+            for fruit, count in fruit_counts.items():
+                if count > 0:
+                    with cols[col_idx % 5]:
+                        emoji_map = {
+                            'apple': '🍎', 'avocado': '🥑', 'banana': '🍌',
+                            'cherry': '🍒', 'kiwi': '🥝', 'mango': '🥭',
+                            'orange': '🍊', 'pineapple': '🍍', 'strawberry': '🍓',
+                            'watermelon': '🍉'
+                        }
+                        emoji = emoji_map.get(fruit, '🍇')
+                        st.metric(f"{emoji} {fruit.title()}", count)
+                        col_idx += 1
             
-            with col_apple:
-                st.metric("🍎 Apple Regions", results['apple_crops_found'])
+            # Target fruit statistics
+            col_target, col_total, col_percent = st.columns(3)
+            
+            with col_target:
+                st.metric(f"🎯 {results['target_fruit'].title()} Regions", results['target_crops_found'])
+            
+            with col_total:
+                st.metric("📊 Total Regions", results['total_crops_analyzed'])
             
             with col_percent:
-                st.metric("🍊 Orange Coverage", f"{results['orange_percentage']:.1f}%")
+                st.metric(f"📈 {results['target_fruit'].title()} Coverage", f"{results['target_percentage']:.1f}%")
             
-            # Visualization
-            if results['orange_detections']:
-                st.write("### 🎯 Orange Detection Visualization")
-                vis_image = detector.visualize_detections(original_image, results)
-                st.image(vis_image, caption="Detected Orange Regions", use_container_width=True)
+            # Confidence scores for detected fruits
+            st.write("### 📈 Average Confidence Scores")
+            avg_confidences = results['average_confidences']
+            detected_fruits = {k: v for k, v in avg_confidences.items() if v > 0}
+            
+            if detected_fruits:
+                conf_cols = st.columns(min(len(detected_fruits), 4))
+                for i, (fruit, confidence) in enumerate(detected_fruits.items()):
+                    with conf_cols[i % 4]:
+                        st.metric(f"{fruit.title()} Confidence", f"{confidence:.2f}")
+            
+            # Visualization with all fruits
+            st.write("### 🎯 Multi-Fruit Detection Visualization")
+            vis_image = detector.visualize_detections(original_image, results)
+            st.image(vis_image, caption="All Detected Fruits", use_container_width=True)
         
         else:
-            st.info("Select an input method and analyze an image to see detection results")
+            st.info("Select a target fruit and analyze an image to see detection results")
     
-    # Instructions
-    with st.expander("ℹ️ How to Use Different Input Methods"):
-        st.write("""
-        ### 📤 Upload Image
-        - Click 'Browse files' to upload an image from your device
-        - Supports JPG, JPEG, PNG formats
+    # Enhanced instructions
+    with st.expander("ℹ️ Multi-Fruit Detector Guide"):
+        st.write(f"""
+        ### 🎯 Supported Fruits
+        This detector can identify **10 different fruits**:
+        🍎 Apple, 🥑 Avocado, 🍌 Banana, 🍒 Cherry, 🥝 Kiwi, 
+        🥭 Mango, 🍊 Orange, 🍍 Pineapple, 🍓 Strawberry, 🍉 Watermelon
         
-        ### 📸 Camera Capture  
-        - Click 'Take a photo' to capture using your device camera
-        - Works on both desktop and mobile devices [[4]]
+        ### 🔧 How It Works
+        - **Grid Analysis**: Divides images into overlapping regions for thorough detection
+        - **Multi-Class Recognition**: Identifies all fruits simultaneously 
+        - **Target Focus**: Highlights your selected target fruit while showing all detected fruits
+        - **Confidence Scoring**: Shows detection confidence for each fruit type
         
-        ### 📹 Live Camera Feed
-        - Real-time camera feed using WebRTC [[1]]
-        - Click 'Capture Current Frame' to grab a frame for analysis
-        - Requires camera permissions
+        ### 📤 Input Methods
+        - **Upload Image**: Most reliable, supports JPG/PNG formats
+        - **Camera Capture**: Direct photo capture, works on mobile and desktop
+        - **Live Camera**: Real-time feed with frame capture (may need permissions)
+        
+        ### 🎨 Visualization
+        - Different colored bounding boxes for each fruit type
+        - Confidence scores displayed on each detection
+        - Complete fruit distribution statistics
         """)
 
 if __name__ == "__main__":
